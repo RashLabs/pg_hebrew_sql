@@ -16,12 +16,19 @@ Ported from [pg_hebrew](https://github.com/RashLabs/pg_hebrew) (Rust/pgrx).
 
 ### On RDS or any PostgreSQL 14+
 
-```bash
-# 1. Generate data (only needed once, already included in sql/004_data.sql)
-python3 scripts/extract_hspell_data.py
+1. Place the Hspell source files under `pg_hebrew_sql/hspell-data/` (or pass `--hspell-dir`).
 
-# 2. Install
-psql -h your-host -U your-user -d your-db -f sql/install.sql
+2. Generate `sql/004_data.sql`:
+
+```powershell
+Set-Location "C:\dev\MosesLabs\pg_hebrew_sql"
+python ".\scripts\extract_hspell_data.py"
+```
+
+3. Install:
+
+```powershell
+$env:PGPASSWORD="your-password"; psql -h 127.0.0.1 -U your-user -d your-db -v ON_ERROR_STOP=1 -f ".\sql\install.sql"
 ```
 
 ### Quick test

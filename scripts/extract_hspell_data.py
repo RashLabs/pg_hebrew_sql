@@ -1,12 +1,50 @@
 #!/usr/bin/env python3
 """Extract hspell binary data into SQL for pg_hebrew_sql."""
 
+import argparse
 import gzip
 import os
-import sys
 
-HSPELL_DIR = os.path.join(os.path.dirname(__file__), '../../pg_hebrew/hspell-data')
+SCRIPT_DIR = os.path.dirname(__file__)
+HSPELL_DIR = os.path.join(SCRIPT_DIR, '../hspell-data')
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), '../sql')
+REQUIRED_HSPELL_FILES = (
+    'dmask.c',
+    'hebrew.wgz.sizes',
+    'hebrew.wgz',
+    'prefix_noH.gz',
+    'prefix_h.gz',
+    'hebrew.wgz.prefixes',
+    'hebrew.wgz.desc',
+    'hebrew.wgz.stems',
+    'hebrew_stop.txt',
+)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Extract Hspell binary data into sql/004_data.sql."
+    )
+    parser.add_argument(
+        "--hspell-dir",
+        default=HSPELL_DIR,
+        help="Path to hspell-data directory (default: pg_hebrew_sql/hspell-data).",
+    )
+    return parser.parse_args()
+
+
+def validate_hspell_dir(path):
+    missing = []
+    for name in REQUIRED_HSPELL_FILES:
+        file_path = os.path.join(path, name)
+        if not os.path.exists(file_path):
+            missing.append(name)
+    if missing:
+        missing_text = ', '.join(missing)
+        raise FileNotFoundError(
+            f"hspell-data directory missing required files: {missing_text}. "
+            f"Looked under: {path}"
+        )
 
 
 def iso8859_to_unicode(b):
@@ -165,8 +203,14 @@ def escape_sql(s):
 
 
 def main():
+    global HSPELL_DIR
+    args = parse_args()
+    HSPELL_DIR = os.path.abspath(args.hspell_dir)
+    validate_hspell_dir(HSPELL_DIR)
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
+    print(f"Using hspell-data from: {HSPELL_DIR}")
     print("Parsing dmasks...")
     dmasks = parse_dmasks()
     

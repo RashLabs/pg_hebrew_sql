@@ -15,7 +15,7 @@ RETURNS BOOLEAN AS $$
 BEGIN
     RETURN EXISTS (SELECT 1 FROM hebrew_fts.stop_words WHERE word = w);
 END;
-$$ LANGUAGE plpgsql IMMUTABLE STRICT;
+$$ LANGUAGE plpgsql STABLE STRICT;
 
 -- Check if a string is a legal Hebrew prefix
 CREATE OR REPLACE FUNCTION hebrew_fts.is_legal_prefix(p TEXT)
@@ -24,7 +24,7 @@ BEGIN
     IF p = '' THEN RETURN TRUE; END IF;
     RETURN EXISTS (SELECT 1 FROM hebrew_fts.prefixes WHERE prefix = p);
 END;
-$$ LANGUAGE plpgsql IMMUTABLE STRICT;
+$$ LANGUAGE plpgsql STABLE STRICT;
 
 -- Get prefix mask
 CREATE OR REPLACE FUNCTION hebrew_fts.get_prefix_mask(p TEXT)
@@ -35,7 +35,7 @@ BEGIN
     SELECT mask INTO m FROM hebrew_fts.prefixes WHERE prefix = p;
     RETURN m;
 END;
-$$ LANGUAGE plpgsql IMMUTABLE STRICT;
+$$ LANGUAGE plpgsql STABLE STRICT;
 
 -- Try stripping prefix before quote characters (gershayim/geresh)
 CREATE OR REPLACE FUNCTION hebrew_fts.try_strip_prefix_quote(w TEXT)
@@ -221,10 +221,10 @@ BEGIN
         lemmas := hebrew_fts.lexize(w);
         IF lemmas IS NOT NULL AND array_length(lemmas, 1) > 0 THEN
             IF array_length(lemmas, 1) = 1 THEN
-                parts := array_append(parts, '''' || lemmas[1] || '''');
+                parts := array_append(parts, '''' || replace(lemmas[1], '''', '''''') || '''');
             ELSE
                 parts := array_append(parts, '(' || array_to_string(
-                    (SELECT array_agg('''' || l || '''') FROM unnest(lemmas) AS l), ' | '
+                    (SELECT array_agg('''' || replace(l, '''', '''''') || '''') FROM unnest(lemmas) AS l), ' | '
                 ) || ')');
             END IF;
         END IF;
@@ -234,6 +234,168 @@ BEGIN
         RETURN (array_to_string(parts, ' & '))::tsquery;
     END IF;
     
+    RETURN ''::tsquery;
+END;
+$$ LANGUAGE plpgsql STABLE STRICT;
+
+-- Websearch-style query parser with Hebrew morphology
+-- Supports: "exact phrase", OR, -negation, implicit AND
+CREATE OR REPLACE FUNCTION hebrew_fts.websearch_to_tsquery(input TEXT)
+RETURNS tsquery AS $$
+DECLARE
+    raw TEXT;
+    pos INTEGER := 1;
+    len INTEGER;
+    ch TEXT;
+    token TEXT;
+    token_lemmas TEXT[];
+    parts TEXT[] := '{}';        -- top-level parts joined by &
+    phrase_parts TEXT[] := '{}'; -- phrase lemmas joined by <->
+    negate BOOLEAN := FALSE;
+    next_or BOOLEAN := FALSE;
+    part TEXT;
+    lemma_expr TEXT;
+    result tsquery;
+BEGIN
+    raw := trim(input);
+    IF raw = '' OR raw IS NULL THEN
+        RETURN ''::tsquery;
+    END IF;
+    len := length(raw);
+
+    WHILE pos <= len LOOP
+        ch := substring(raw FROM pos FOR 1);
+
+        -- Skip whitespace
+        IF ch = ' ' OR ch = E'\t' OR ch = E'\n' OR ch = E'\r' THEN
+            pos := pos + 1;
+            CONTINUE;
+        END IF;
+
+        -- Quoted phrase
+        IF ch = '"' THEN
+            pos := pos + 1;
+            phrase_parts := '{}';
+            WHILE pos <= len LOOP
+                ch := substring(raw FROM pos FOR 1);
+                IF ch = '"' THEN
+                    pos := pos + 1;
+                    EXIT;
+                END IF;
+                -- Collect word inside phrase
+                IF ch = ' ' OR ch = E'\t' THEN
+                    pos := pos + 1;
+                    CONTINUE;
+                END IF;
+                token := '';
+                WHILE pos <= len LOOP
+                    ch := substring(raw FROM pos FOR 1);
+                    IF ch = '"' OR ch = ' ' OR ch = E'\t' THEN EXIT; END IF;
+                    token := token || ch;
+                    pos := pos + 1;
+                END LOOP;
+                IF token != '' THEN
+                    token_lemmas := hebrew_fts.lexize(lower(token));
+                    IF token_lemmas IS NOT NULL AND array_length(token_lemmas, 1) > 0 THEN
+                        IF array_length(token_lemmas, 1) = 1 THEN
+                            phrase_parts := array_append(phrase_parts,
+                                '''' || replace(token_lemmas[1], '''', '''''') || '''');
+                        ELSE
+                            phrase_parts := array_append(phrase_parts,
+                                '(' || array_to_string(
+                                    (SELECT array_agg('''' || replace(l, '''', '''''') || '''')
+                                     FROM unnest(token_lemmas) AS l), ' | '
+                                ) || ')');
+                        END IF;
+                    END IF;
+                END IF;
+            END LOOP;
+            -- Build phrase with <-> (adjacent) operator
+            IF array_length(phrase_parts, 1) > 0 THEN
+                part := array_to_string(phrase_parts, ' <-> ');
+                IF negate THEN
+                    part := '!' || '(' || part || ')';
+                    negate := FALSE;
+                END IF;
+                IF next_or AND array_length(parts, 1) > 0 THEN
+                    parts[array_length(parts, 1)] :=
+                        parts[array_length(parts, 1)] || ' | ' || part;
+                    next_or := FALSE;
+                ELSE
+                    parts := array_append(parts, part);
+                    next_or := FALSE;
+                END IF;
+            END IF;
+            CONTINUE;
+        END IF;
+
+        -- Negation prefix
+        IF ch = '-' THEN
+            negate := TRUE;
+            pos := pos + 1;
+            CONTINUE;
+        END IF;
+
+        -- Collect bare token
+        token := '';
+        WHILE pos <= len LOOP
+            ch := substring(raw FROM pos FOR 1);
+            IF ch = ' ' OR ch = E'\t' OR ch = E'\n' OR ch = E'\r' OR ch = '"' THEN EXIT; END IF;
+            token := token || ch;
+            pos := pos + 1;
+        END LOOP;
+
+        -- Check for OR keyword
+        IF upper(token) = 'OR' THEN
+            next_or := TRUE;
+            CONTINUE;
+        END IF;
+
+        -- Skip empty tokens
+        IF token = '' THEN
+            CONTINUE;
+        END IF;
+
+        -- Lemmatize token
+        token_lemmas := hebrew_fts.lexize(lower(token));
+        IF token_lemmas IS NULL OR array_length(token_lemmas, 1) = 0 THEN
+            CONTINUE;
+        END IF;
+
+        IF array_length(token_lemmas, 1) = 1 THEN
+            lemma_expr := '''' || replace(token_lemmas[1], '''', '''''') || '''';
+        ELSE
+            lemma_expr := '(' || array_to_string(
+                (SELECT array_agg('''' || replace(l, '''', '''''') || '''')
+                 FROM unnest(token_lemmas) AS l), ' | '
+            ) || ')';
+        END IF;
+
+        IF negate THEN
+            lemma_expr := '!' || lemma_expr;
+            negate := FALSE;
+        END IF;
+
+        IF next_or AND array_length(parts, 1) > 0 THEN
+            parts[array_length(parts, 1)] :=
+                parts[array_length(parts, 1)] || ' | ' || lemma_expr;
+            next_or := FALSE;
+        ELSE
+            parts := array_append(parts, lemma_expr);
+            next_or := FALSE;
+        END IF;
+    END LOOP;
+
+    IF array_length(parts, 1) > 0 THEN
+        BEGIN
+            result := (array_to_string(parts, ' & '))::tsquery;
+            RETURN result;
+        EXCEPTION WHEN OTHERS THEN
+            -- Fall back to plain to_tsquery if parse fails
+            RETURN hebrew_fts.to_tsquery(input);
+        END;
+    END IF;
+
     RETURN ''::tsquery;
 END;
 $$ LANGUAGE plpgsql STABLE STRICT;

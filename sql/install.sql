@@ -1,6 +1,8 @@
 -- pg_hebrew_sql installer
 -- Run: psql -d your_database -f sql/install.sql
 
+\set ON_ERROR_STOP on
+
 \echo 'Creating schema and tables...'
 \i sql/001_schema.sql
 

@@ -89,15 +89,15 @@ All three use `websearch_to_tsquery('simple', query_text)` for query parsing.
 
 ### Step 1: Install pg_hebrew_sql on RDS
 
-```bash
+```powershell
 # Generate the data file (run once on your local machine)
-cd pg_hebrew_sql
-python3 scripts/extract_hspell_data.py
+Set-Location "C:\dev\MosesLabs\pg_hebrew_sql"
+python ".\scripts\extract_hspell_data.py"
 
 # Upload and run on RDS
-psql -h your-rds-host -U your-user -d moses_db -f sql/001_schema.sql
-psql -h your-rds-host -U your-user -d moses_db -f sql/002_functions.sql
-psql -h your-rds-host -U your-user -d moses_db -f sql/004_data.sql  # ~24MB, takes 1-2 min
+$env:PGPASSWORD="your-password"; psql -h "your-rds-host" -U "your-user" -d "moses_db" -v ON_ERROR_STOP=1 -f ".\sql\001_schema.sql"
+$env:PGPASSWORD="your-password"; psql -h "your-rds-host" -U "your-user" -d "moses_db" -v ON_ERROR_STOP=1 -f ".\sql\002_functions.sql"
+$env:PGPASSWORD="your-password"; psql -h "your-rds-host" -U "your-user" -d "moses_db" -v ON_ERROR_STOP=1 -f ".\sql\004_data.sql"  # ~24MB, takes 1-2 min
 ```
 
 ### Step 2: Run the migration SQL
@@ -105,20 +105,29 @@ psql -h your-rds-host -U your-user -d moses_db -f sql/004_data.sql  # ~24MB, tak
 ```sql
 -- File: backend/migrations/migrate_hebrew_fts.sql
 
+-- Kill other connections so ALTER TABLE doesn't hang waiting for locks
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname = current_database() AND pid != pg_backend_pid();
+
 -- 1. Drop existing index
 DROP INDEX IF EXISTS idx_chunks_content_tsv;
 
--- 2. Drop the old generated column
+-- 2. Drop existing trigger/function (rerunnable migration)
+DROP TRIGGER IF EXISTS trg_chunks_content_tsv ON chunks;
+DROP FUNCTION IF EXISTS public.update_content_tsv();
+
+-- 3. Drop the old generated column
 ALTER TABLE chunks DROP COLUMN IF EXISTS content_tsv;
 
--- 3. Add new column using hebrew_fts.to_tsvector
+-- 4. Add new column using hebrew_fts.to_tsvector
 --    NOTE: Generated columns can't call non-IMMUTABLE functions.
 --    hebrew_fts.lexize() is STABLE (reads tables), so we use a trigger instead.
 
 ALTER TABLE chunks ADD COLUMN content_tsv tsvector;
 
--- 4. Create the trigger function
-CREATE OR REPLACE FUNCTION update_content_tsv() RETURNS trigger AS $$
+-- 5. Create the trigger function
+CREATE OR REPLACE FUNCTION public.update_content_tsv() RETURNS trigger AS $$
 BEGIN
     NEW.content_tsv := hebrew_fts.to_tsvector(coalesce(NEW.content, ''));
     RETURN NEW;
@@ -128,15 +137,15 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER trg_chunks_content_tsv
     BEFORE INSERT OR UPDATE OF content ON chunks
     FOR EACH ROW
-    EXECUTE FUNCTION update_content_tsv();
+    EXECUTE FUNCTION public.update_content_tsv();
 
--- 5. Backfill existing rows (this is the slow part — depends on table size)
+-- 6. Backfill existing rows (this is the slow part — depends on table size)
 UPDATE chunks SET content_tsv = hebrew_fts.to_tsvector(coalesce(content, ''));
 
--- 6. Recreate the GIN index
+-- 7. Recreate the GIN index
 CREATE INDEX idx_chunks_content_tsv ON chunks USING gin (content_tsv);
 
--- 7. Analyze for query planner
+-- 8. Analyze for query planner
 ANALYZE chunks;
 ```
 
@@ -236,7 +245,7 @@ If something goes wrong, revert to the old approach:
 ```sql
 -- Drop new trigger
 DROP TRIGGER IF EXISTS trg_chunks_content_tsv ON chunks;
-DROP FUNCTION IF EXISTS update_content_tsv();
+DROP FUNCTION IF EXISTS public.update_content_tsv();
 
 -- Drop and recreate old column
 DROP INDEX IF EXISTS idx_chunks_content_tsv;
