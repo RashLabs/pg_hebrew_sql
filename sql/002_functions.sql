@@ -247,6 +247,8 @@ DECLARE
     pos INTEGER := 1;
     len INTEGER;
     ch TEXT;
+    prev_ch TEXT;
+    next_ch TEXT;
     token TEXT;
     token_lemmas TEXT[];
     parts TEXT[] := '{}';        -- top-level parts joined by &
@@ -256,6 +258,7 @@ DECLARE
     part TEXT;
     lemma_expr TEXT;
     result tsquery;
+    is_abbrev_quote BOOLEAN;
 BEGIN
     raw := trim(input);
     IF raw = '' OR raw IS NULL THEN
@@ -272,8 +275,26 @@ BEGIN
             CONTINUE;
         END IF;
 
-        -- Quoted phrase
+        -- Quoted phrase — but first check for Hebrew abbreviation quotes (גרשיים)
+        -- e.g., דסק"ש, בע"מ, עו"ד — letter + " + letter = abbreviation, not phrase
         IF ch = '"' THEN
+            is_abbrev_quote := FALSE;
+            IF pos > 1 AND pos < len THEN
+                prev_ch := substring(raw FROM pos - 1 FOR 1);
+                next_ch := substring(raw FROM pos + 1 FOR 1);
+                -- Hebrew Unicode range: U+0590–U+05FF (א-ת and diacritics)
+                IF prev_ch ~ '[\u0590-\u05FF]' AND next_ch ~ '[\u0590-\u05FF]' THEN
+                    is_abbrev_quote := TRUE;
+                END IF;
+            END IF;
+
+            IF is_abbrev_quote THEN
+                -- Skip the abbreviation quote mark — the surrounding letters will be
+                -- collected as separate bare tokens and AND'd together.
+                -- E.g., דסק"ש → tokens 'דסק' & 'ש' — functionally correct for search.
+                pos := pos + 1;
+                CONTINUE;
+            END IF;
             pos := pos + 1;
             phrase_parts := '{}';
             WHILE pos <= len LOOP
@@ -290,7 +311,19 @@ BEGIN
                 token := '';
                 WHILE pos <= len LOOP
                     ch := substring(raw FROM pos FOR 1);
-                    IF ch = '"' OR ch = ' ' OR ch = E'\t' THEN EXIT; END IF;
+                    IF ch = ' ' OR ch = E'\t' THEN EXIT; END IF;
+                    -- Handle abbreviation quotes inside phrases too
+                    IF ch = '"' THEN
+                        IF pos > 1 AND pos < len THEN
+                            prev_ch := substring(raw FROM pos - 1 FOR 1);
+                            next_ch := substring(raw FROM pos + 1 FOR 1);
+                            IF prev_ch ~ '[\u0590-\u05FF]' AND next_ch ~ '[\u0590-\u05FF]' THEN
+                                pos := pos + 1;
+                                CONTINUE;
+                            END IF;
+                        END IF;
+                        EXIT;  -- Closing quote of phrase
+                    END IF;
                     token := token || ch;
                     pos := pos + 1;
                 END LOOP;
@@ -340,7 +373,15 @@ BEGIN
         token := '';
         WHILE pos <= len LOOP
             ch := substring(raw FROM pos FOR 1);
-            IF ch = ' ' OR ch = E'\t' OR ch = E'\n' OR ch = E'\r' OR ch = '"' THEN EXIT; END IF;
+            IF ch = ' ' OR ch = E'\t' OR ch = E'\n' OR ch = E'\r' THEN EXIT; END IF;
+            -- Handle " inside token: if it's a Hebrew abbreviation quote (letter"letter),
+            -- stop the current token here. The main loop will then see the " and skip it
+            -- (via the abbreviation detection above), then collect the remaining letters
+            -- as a separate token. The two parts get AND'd together, matching the tsvector
+            -- behavior which also splits on the quote (e.g., דסק"ש → 'דסק' & 'ש').
+            IF ch = '"' THEN
+                EXIT;  -- Stop collecting — main loop handles the quote
+            END IF;
             token := token || ch;
             pos := pos + 1;
         END LOOP;

@@ -94,6 +94,50 @@ BEGIN
         RAISE NOTICE 'PASS: websearch_to_tsquery empty';
     END;
 
+    -- Test 13: websearch_to_tsquery Hebrew abbreviation (גרשיים) — דסק"ש OR
+    DECLARE
+        q tsquery;
+    BEGIN
+        q := hebrew_fts.websearch_to_tsquery('דסק"ש OR בריטיש');
+        ASSERT q IS NOT NULL AND q::text != '', 'abbreviation OR failed';
+        ASSERT position('|' in q::text) > 0,
+            'דסק"ש OR בריטיש should contain |, got: ' || q::text;
+        -- Should NOT contain 'or' as literal
+        ASSERT position('''or''' in q::text) = 0,
+            'OR should not be literal, got: ' || q::text;
+        RAISE NOTICE 'PASS: abbreviation OR = %', q;
+    END;
+
+    -- Test 14: abbreviation tsvector match
+    DECLARE
+        ok BOOLEAN;
+    BEGIN
+        ok := hebrew_fts.to_tsvector('דסק"ש היא חברת השקעות')
+              @@ hebrew_fts.websearch_to_tsquery('דסק"ש');
+        ASSERT ok, 'דסק"ש tsvector should match websearch query';
+        RAISE NOTICE 'PASS: abbreviation tsvector match';
+    END;
+
+    -- Test 15: multiple abbreviations with OR
+    DECLARE
+        q tsquery;
+    BEGIN
+        q := hebrew_fts.websearch_to_tsquery('בע"מ OR עו"ד OR דסק"ש');
+        ASSERT q IS NOT NULL AND q::text != '', 'multi-abbreviation OR failed: ' || coalesce(q::text, 'NULL');
+        RAISE NOTICE 'PASS: multi-abbreviation OR = %', q;
+    END;
+
+    -- Test 16: abbreviation mixed with phrases
+    DECLARE
+        q tsquery;
+    BEGIN
+        q := hebrew_fts.websearch_to_tsquery('דסק"ש OR בריטיש OR "בריטיש ישראל" OR "דיסקונט השקעות"');
+        ASSERT q IS NOT NULL AND q::text != '', 'abbrev+phrase mix failed';
+        ASSERT position('|' in q::text) > 0, 'should contain |, got: ' || q::text;
+        ASSERT position('<->' in q::text) > 0, 'should contain <->, got: ' || q::text;
+        RAISE NOTICE 'PASS: abbreviation + phrase mix = %', q;
+    END;
+
     RAISE NOTICE '✅ All tests passed!';
 END;
 $$;
